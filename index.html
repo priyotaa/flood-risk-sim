@@ -1,0 +1,172 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Charles River — Flood Risk Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    body{font-family:Inter,system-ui,Arial;margin:0;background:linear-gradient(180deg,#eaf6ff, #f6fbff);}
+    #topbar{height:72px;display:flex;align-items:center;padding:0 20px;box-shadow:0 2px 6px rgba(20,30,40,0.05);background:rgba(255,255,255,0.6);}
+    #title{font-weight:700;font-size:18px}
+    #container{display:flex;gap:16px;padding:16px;max-width:1200px;margin:18px auto;}
+    #map{flex:1;min-height:640px;border-radius:12px;overflow:hidden;box-shadow:0 8px 30px rgba(20,30,40,0.08)}
+    #side{width:360px;display:flex;flex-direction:column;gap:12px}
+    .card{background:white;padding:12px;border-radius:10px;box-shadow:0 6px 18px rgba(10,20,30,0.04)}
+    .legend-item{display:flex;align-items:center;gap:8px;margin:6px 0}
+    .dot{width:14px;height:14px;border-radius:50%;display:inline-block}
+    .list {max-height:260px;overflow:auto}
+    .station-row{display:flex;justify-content:space-between;padding:8px;border-bottom:1px solid #f0f3f5}
+    .btn{background:#1f7ed4;color:white;padding:8px 10px;border-radius:8px;border:0;cursor:pointer}
+    .small{font-size:13px;color:#666}
+    #chart{height:180px}
+    #subscribe-form input{width:100%;padding:8px;margin-bottom:8px;border-radius:6px;border:1px solid #ddd}
+  </style>
+</head>
+<body>
+  <div id="topbar"><div id="title">Charles River — Flood Risk Dashboard (Demo)</div></div>
+  <div id="container">
+    <div id="map" class="card"></div>
+    <div id="side">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div><strong>Stations</strong><div class="small">Live USGS gauges</div></div>
+          <button id="refreshBtn" class="btn">Refresh</button>
+        </div>
+        <div id="stationsList" class="list" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card">
+        <strong>Legend</strong>
+        <div class="legend-item"><span class="dot" style="background:#2ecc71"></span> Low</div>
+        <div class="legend-item"><span class="dot" style="background:#f39c12"></span> Medium</div>
+        <div class="legend-item"><span class="dot" style="background:#e74c3c"></span> High</div>
+      </div>
+
+      <div class="card">
+        <strong>Venues & Subscriptions</strong>
+        <div id="venues"></div>
+        <div style="margin-top:8px"><small class="small">Subscribe to a venue to get demo alerts when nearby station risk becomes medium/high.</small></div>
+      </div>
+
+      <div class="card">
+        <strong>Per-station History</strong>
+        <canvas id="chart"></canvas>
+      </div>
+
+      <div class="card" id="subscribe-card">
+        <strong>Subscribe (demo)</strong>
+        <form id="subscribe-form">
+          <select id="sub-venue"></select>
+          <input id="sub-name" placeholder="Your name (optional)">
+          <input id="sub-email" placeholder="Email (demo only)">
+          <button class="btn" type="button" id="sub-btn">Subscribe</button>
+        </form>
+        <div id="sub-result" class="small"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <script>
+    // --- Map init ---
+    const map = L.map('map').setView([42.35, -71.09], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap contributors'}).addTo(map);
+
+    let stationMarkers = {};
+    let venueMarkers = {};
+    let chart = null;
+
+    // helper color by risk
+    function colorForRisk(r){
+      if(r==="low") return "#2ecc71";
+      if(r==="medium") return "#f39c12";
+      if(r==="high") return "#e74c3c";
+      return "#888";
+    }
+
+    async function loadStations(){
+      document.getElementById('stationsList').innerHTML = "Loading...";
+      const res = await fetch('/api/stations');
+      const stations = await res.json();
+      document.getElementById('stationsList').innerHTML = "";
+      // remove old markers
+      Object.values(stationMarkers).forEach(m => map.removeLayer(m));
+      stationMarkers = {};
+      stations.forEach(s=>{
+        console.log(s.name, s.history_30d);
+        // circle marker scaled by gage height (or fixed if null)
+        const radius = s.gage_height_ft ? Math.max(6, Math.min(40, s.gage_height_ft*4)) : 8;
+        const color = colorForRisk(s.risk);
+        const m = L.circleMarker([s.lat,s.lon], {radius, color, fillColor: color, fillOpacity:0.6, weight:1.2}).addTo(map);
+        m.bindPopup(`<b>${s.name}</b><br>${s.city}<br>Level: ${s.gage_height_ft? s.gage_height_ft.toFixed(2)+' ft':'n/a'}<br>Risk: ${s.risk.toUpperCase()}`);
+        m.on('click', ()=> showHistory(s)); // click to load chart
+        stationMarkers[s.site] = m;
+
+        // list item
+        const row = document.createElement('div');
+        row.className = "station-row";
+        row.innerHTML = `<div><strong>${s.name}</strong><div class="small">${s.city}</div></div><div style="text-align:right"><div style="font-weight:700">${s.gage_height_ft? s.gage_height_ft.toFixed(2)+' ft':'n/a'}</div><div class="small">${s.risk}</div></div>`;
+        row.addEventListener('click', ()=> { map.panTo([s.lat,s.lon]); stationMarkers[s.site].openPopup(); showHistory(s); });
+        document.getElementById('stationsList').appendChild(row);
+      });
+    }
+
+    // load venues
+    async function loadVenues(){
+      const res = await fetch('/api/venues');
+      const ven = await res.json();
+      const select = document.getElementById('sub-venue');
+      select.innerHTML = "";
+      ven.forEach(v=>{
+        const opt = document.createElement('option'); opt.value = v.id; opt.text = v.name; select.appendChild(opt);
+        const m = L.marker([v.lat, v.lon], {title:v.name}).addTo(map);
+        m.bindPopup(`<b>${v.name}</b><br>${v.address}`);
+        venueMarkers[v.id] = m;
+        // display on side
+        const div = document.createElement('div'); div.style.margin='8px 0';
+        div.innerHTML = `<strong>${v.name}</strong><div class="small">${v.address}</div>`;
+        document.getElementById('venues').appendChild(div);
+      });
+    }
+
+    // chart for history (Chart.js)
+    function showHistory(station){
+      if(!station.history_30d || station.history_30d.length===0){
+        // fetch history from station object if not present (backend includes it)
+        alert("No history available for this station right now.");
+        return;
+      }
+      const labels = station.history_30d.map(h=>h.date);
+      const values = station.history_30d.map(h=>h.value);
+      const ctx = document.getElementById('chart').getContext('2d');
+      if(chart) chart.destroy();
+      chart = new Chart(ctx, {
+        type:'line',
+        data:{labels, datasets:[{label: station.name + " (gage ft)", data: values, fill:true, tension:0.2, backgroundColor:'rgba(40,140,200,0.12)', borderColor:'#1f7ed4'}]},
+        options:{plugins:{legend:{display:false}}}
+      });
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', ()=> { loadStations(); });
+
+    // subscribe demo
+    document.getElementById('sub-btn').addEventListener('click', async ()=> {
+      const venue = document.getElementById('sub-venue').value;
+      const name = document.getElementById('sub-name').value;
+      const email = document.getElementById('sub-email').value;
+      if(!email){ document.getElementById('sub-result').innerText="Email required."; return; }
+      const r = await fetch('/api/subscribe', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({venue_id:venue, name, email})});
+      const j = await r.json();
+      document.getElementById('sub-result').innerText = j.status ? "Subscribed! (demo)" : ("Error: "+(j.error||"unknown"));
+    });
+
+    // initial load
+    (async ()=>{ await loadStations(); await loadVenues(); })();
+  </script>
+</body>
+</html>
+
+
